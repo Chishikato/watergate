@@ -1,12 +1,10 @@
+// RECEIVER
 #include <SPI.h>
 #include <nRF24L01.h>
 #include <RF24.h>
-
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-
-#include <avr/wdt.h>
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -22,96 +20,49 @@ struct Payload {
   int32_t pressurePa;
 };
 
-Payload last = {0, 0, 0};
+Payload lastRecv = {0, 0, 0};
 unsigned long lastRecvMs = 0;
-
 unsigned long lastDrawMs = 0;
 const unsigned long DRAW_INTERVAL_MS = 350;
 
-bool initOLED(uint8_t addr) {
-  if (!display.begin(SSD1306_SWITCHCAPVCC, addr)) return false;
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.display();
-  return true;
-}
-
-void drawUI(const Payload& p, bool linkOK) {
-  display.clearDisplay();
-
-  display.setCursor(0, 0);
-  display.print("RECEIVER (Remote)");
-
-  display.setCursor(0, 12);
-  display.print("Link: ");
-  display.print(linkOK ? "OK" : "NO DATA");
-
-  display.setCursor(0, 24);
-  display.print("Water: ");
-  display.print(p.waterRaw);
-
-  display.setCursor(0, 36);
-  display.print("Temp: ");
-  display.print(p.tempC_x10 / 10.0);
-  display.print("C");
-
-  display.setCursor(0, 48);
-  display.print("Pres: ");
-  display.print(p.pressurePa / 100.0);
-  display.print("hPa");
-
-  display.display();
-}
-
 void setup() {
   Serial.begin(9600);
-
-  wdt_enable(WDTO_2S);
-
   Wire.begin();
-  Wire.setClock(100000);
-#if defined(TWCR) && defined(TWEN)
-  Wire.setWireTimeout(25000, true);
-#endif
-
-  bool oledOK = initOLED(0x3C) || initOLED(0x3D);
-  if (!oledOK) {
-    Serial.println("Receiver OLED not found");
-    while (true) {}
+  
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("OLED Fail"));
   }
 
   radio.begin();
   radio.setChannel(RF_CHANNEL);
   radio.setPALevel(RF24_PA_MIN);
-  radio.setDataRate(RF24_250KBPS);
+  radio.setDataRate(RF24_250KBPS); // Must match Sender
   radio.setAutoAck(true);
-  radio.setRetries(5, 15);
   radio.openReadingPipe(1, address);
   radio.startListening();
-
-  Serial.println("Receiver ready");
 }
 
 void loop() {
-  wdt_reset();
-
-  bool gotNew = false;
-  while (radio.available()) {
-    Payload p;
-    radio.read(&p, sizeof(p));
-    last = p;
+  if (radio.available()) {
+    radio.read(&lastRecv, sizeof(Payload));
     lastRecvMs = millis();
-    gotNew = true;
   }
-
-  bool linkOK = (millis() - lastRecvMs) < 1500;
 
   unsigned long now = millis();
-  if (gotNew || (now - lastDrawMs) >= DRAW_INTERVAL_MS) {
-    drawUI(last, linkOK);
+  if (now - lastDrawMs >= DRAW_INTERVAL_MS) {
+    bool linkOK = (now - lastRecvMs < 2000); // 2-second timeout
+    
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.setTextColor(SSD1306_WHITE);
+    display.println(F("RECEIVER (Remote)"));
+    display.print(F("Link: ")); display.println(linkOK ? F("OK") : F("LOST"));
+    
+    if(linkOK) {
+      display.print(F("H2O:  ")); display.println(lastRecv.waterRaw);
+      display.print(F("Temp: ")); display.print(lastRecv.tempC_x10/10.0); display.println(F("C"));
+    }
+    display.display();
     lastDrawMs = now;
   }
-
-  delay(5);
 }
