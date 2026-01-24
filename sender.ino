@@ -1,6 +1,7 @@
 // ===================== SENDER.ino =====================
-// UI: Bar graph + % (no raw water shown on OLED)
-// Payload: waterRaw (debug), waterPct (display), tempC_x10
+// OLED: Big status (DRY/SEMI/MOIST/WET) + bar + small %
+// OLED does NOT show raw water, and does NOT show pressure.
+// Serial prints raw for calibration/debug.
 
 #include <SPI.h>
 #include <nRF24L01.h>
@@ -24,16 +25,18 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 Adafruit_BMP085 bmp;
 bool bmpOK = false;
 
-// ---------- Calibration (EDIT THESE) ----------
-// If your sensor works "backwards", swap EMPTY and FULL.
-const int WATER_RAW_EMPTY = 0;     // raw when "empty" / dry
-const int WATER_RAW_FULL  = 1023;  // raw when "full" / wet
+// ---------- Calibration ----------
+// You said DRY = 0
+const int WATER_RAW_EMPTY = 0;
+
+// Set this to your fully-wet max reading (watch Serial when fully wet)
+const int WATER_RAW_FULL  = 1023;
 
 // ---------- Payload ----------
 struct Payload {
-  int16_t waterRaw;      // keep for debug (NOT displayed on OLED)
-  uint8_t waterPct;      // 0..100 (display)
-  int16_t tempC_x10;     // temperature * 10
+  int16_t waterRaw;      // debug only (NOT shown on OLED)
+  uint8_t waterPct;      // 0..100 (used for bar + label)
+  int16_t tempC_x10;     // temp * 10
 };
 
 Payload p;
@@ -50,19 +53,26 @@ const unsigned long DRAW_INTERVAL_MS = 250;
 bool lastRfOK = false;
 uint32_t txCount = 0;
 
-// Smoothed percent (reduces jitter)
+// Smoothed percent to reduce jitter
 uint8_t waterPctSmooth = 0;
 
 static uint8_t rawToPercent(int16_t raw) {
-  long pct;
-  if (WATER_RAW_FULL > WATER_RAW_EMPTY) {
-    pct = (long)(raw - WATER_RAW_EMPTY) * 100L / (long)(WATER_RAW_FULL - WATER_RAW_EMPTY);
-  } else {
-    pct = (long)(WATER_RAW_EMPTY - raw) * 100L / (long)(WATER_RAW_EMPTY - WATER_RAW_FULL);
-  }
+  long denom = (long)(WATER_RAW_FULL - WATER_RAW_EMPTY);
+  if (denom == 0) return 0;
+
+  long pct = (long)(raw - WATER_RAW_EMPTY) * 100L / denom;
+
+  // If FULL < EMPTY (reversed), pct could invert; clamp anyway
   if (pct < 0) pct = 0;
   if (pct > 100) pct = 100;
   return (uint8_t)pct;
+}
+
+static const char* moistureLabel(uint8_t pct) {
+  if (pct <= 25) return "DRY";
+  if (pct <= 50) return "SEMI";
+  if (pct <= 75) return "MOIST";
+  return "WET";
 }
 
 static void drawBar(int x, int y, int w, int h, uint8_t pct) {
@@ -84,17 +94,26 @@ static void drawUI(bool rfOK, uint8_t pct, bool hasTemp, float tempC) {
   display.print(F("RF:"));
   display.print(rfOK ? F("OK") : F("FAIL"));
 
-  // Big percent
+  // Big status
+  const char* label = moistureLabel(pct);
   display.setTextSize(2);
   display.setCursor(0, 14);
-  display.print(pct);
-  display.print(F("%"));
+  display.print(label);
 
-  // Bar graph
-  drawBar(0, 38, 128, 12, pct);
-
-  // Footer (temp + tx count)
+  // Bar line: label + bar + small %
   display.setTextSize(1);
+  int barX = 40, barY = 38, barW = 70, barH = 10;
+
+  display.setCursor(0, 36);
+  display.print(label);
+
+  drawBar(barX, barY, barW, barH, pct);
+
+  display.setCursor(114, 36);
+  display.print(pct);
+  display.print('%');
+
+  // Footer: temp + tx count
   display.setCursor(0, 54);
   display.print(F("Temp: "));
   if (hasTemp) {
@@ -111,19 +130,25 @@ static void drawUI(bool rfOK, uint8_t pct, bool hasTemp, float tempC) {
   display.display();
 }
 
+static bool oledBeginAutoAddr() {
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) return true;
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) return true;
+  return false;
+}
+
 void setup() {
   Serial.begin(9600);
   Wire.begin();
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("OLED Fail"));
+  if (!oledBeginAutoAddr()) {
+    Serial.println(F("OLED init failed (0x3C/0x3D)."));
   }
   display.clearDisplay();
   display.display();
 
   bmpOK = bmp.begin();
 
-  // Radio config (stable)
+  // Radio config
   radio.begin();
   radio.setChannel(RF_CHANNEL);
   radio.setPALevel(RF24_PA_MIN);
@@ -147,7 +172,7 @@ void loop() {
     p.waterRaw = (int16_t)analogRead(A0);
     p.waterPct = rawToPercent(p.waterRaw);
 
-    // simple smoothing: 70% old, 30% new
+    // smoothing: 70% old, 30% new
     waterPctSmooth = (uint8_t)((waterPctSmooth * 7 + p.waterPct * 3) / 10);
 
     if (bmpOK) {
@@ -156,9 +181,10 @@ void loop() {
       p.tempC_x10 = 0;
     }
 
-    // Serial debug (raw stays here, not on OLED)
+    // Serial debug (raw is ONLY here)
     Serial.print(F("waterRaw=")); Serial.print(p.waterRaw);
     Serial.print(F(" waterPct=")); Serial.print(p.waterPct);
+    Serial.print(F(" label=")); Serial.print(moistureLabel(p.waterPct));
     Serial.print(F(" tempC="));
     if (bmpOK) Serial.println(p.tempC_x10 / 10.0f);
     else Serial.println(F("N/A"));
